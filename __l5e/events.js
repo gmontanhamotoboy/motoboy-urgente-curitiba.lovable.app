@@ -24,7 +24,24 @@
     return rate >= 1 ? 1 : rate;
   }, "parseSampleRate");
   const replaySampleRate = parseSampleRate(script?.getAttribute("data-replay-sample-rate") || null);
+  const replayCrashSampleRate = parseSampleRate(script?.getAttribute("data-replay-crash-sample-rate") || null);
   const randomId = /* @__PURE__ */ __name(() => w.crypto && typeof w.crypto.randomUUID === "function" ? w.crypto.randomUUID() : String(Date.now()) + "-" + Math.random().toString(16).slice(2), "randomId");
+  const randomTraceHex = /* @__PURE__ */ __name((byteCount) => {
+    const bytes = new Uint8Array(byteCount);
+    if (w.crypto && typeof w.crypto.getRandomValues === "function") {
+      w.crypto.getRandomValues(bytes);
+    } else {
+      for (let index = 0; index < bytes.length; index++) {
+        bytes[index] = Math.floor(Math.random() * 256);
+      }
+    }
+    if (bytes.every((byte) => byte === 0)) bytes[bytes.length - 1] = 1;
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }, "randomTraceHex");
+  const createTraceContext = /* @__PURE__ */ __name(() => ({
+    traceId: randomTraceHex(16),
+    rootSpanId: randomTraceHex(8)
+  }), "createTraceContext");
   const storageGetOrCreate = /* @__PURE__ */ __name((storage, key) => {
     try {
       if (!storage) return { value: randomId(), created: true };
@@ -82,6 +99,7 @@
   let sessionExpiresAt = sessionIdentity.expiresAt;
   let appUserId = null;
   let pageViewId = randomId();
+  let traceContext = createTraceContext();
   const unitIntervalFor = /* @__PURE__ */ __name((value) => {
     let hash = 2166136261;
     for (let index = 0; index < value.length; index++) {
@@ -90,7 +108,11 @@
     }
     return (hash >>> 0) / 4294967296;
   }, "unitIntervalFor");
-  const isReplaySampledIn = replaySampleRate > 0 && unitIntervalFor(sessionId) < replaySampleRate;
+  const replaySamplingValue = unitIntervalFor(sessionId);
+  const isReplaySampledIn = replaySampleRate > 0 && replaySamplingValue < replaySampleRate;
+  const isReplayCrashSampledIn = replayCrashSampleRate > 0 && replaySamplingValue < replayCrashSampleRate;
+  const isReplayRecordingAllowed = isReplaySampledIn || isReplayCrashSampledIn;
+  const replayEffectiveSampleRate = isReplaySampledIn ? replaySampleRate : replayCrashSampleRate;
   let replayId = null;
   let replayEventCount = 0;
   let replayStartedAt = 0;
@@ -100,13 +122,16 @@
   let replayUploadedBytes = 0;
   let replayFlushTimer = null;
   let replayDurationTimer = null;
+  let replayRecorderActive = false;
   let replayRecorderLoading = false;
   let replayHasFullSnapshot = false;
-  let replayCaptureReason = "sampled";
+  let replayUploadEnabled = isReplaySampledIn;
+  let replayCaptureReason = isReplaySampledIn ? "sampled" : null;
   let replayTriggerEventId = null;
   let replayTriggerEventName = null;
   let replayCaptureMetadataEmitted = false;
   const replayQueue = [];
+  const maxReplayBufferedEvents = Math.max(maxReplayEventsPerChunk, maxReplayEventsPerChunk * maxReplayChunks);
   const replayMaskTextSelector = [
     "[data-lovable-mask]",
     "[data-sensitive]",
@@ -253,13 +278,13 @@
     replayDurationTimer = null;
   }, "clearReplayDurationTimer");
   const stopReplayRecorderSafely = /* @__PURE__ */ __name(() => {
-    if (!stopReplayRecorder) return;
     try {
-      stopReplayRecorder();
+      stopReplayRecorder?.();
     } catch {
+    } finally {
       stopReplayRecorder = null;
+      replayRecorderActive = false;
     }
-    stopReplayRecorder = null;
   }, "stopReplayRecorderSafely");
   const replayErrorStageFor = /* @__PURE__ */ __name((reason) => {
     switch (reason) {
@@ -286,14 +311,14 @@
       reason,
       stage,
       recorder: "rrweb",
-      sample_rate: replaySampleRate,
+      sample_rate: replayEffectiveSampleRate,
       event_count: eventCount,
       duration_ms: durationMs,
       chunk_count: chunkCount,
       uploaded_bytes: uploadedBytes
     });
   }, "emitReplayErrorFor");
-  const replayCaptureProperties = /* @__PURE__ */ __name(() => replayCaptureReason === "sampled" ? {} : {
+  const replayCaptureProperties = /* @__PURE__ */ __name(() => !replayCaptureReason || replayCaptureReason === "sampled" ? {} : {
     capture_reason: replayCaptureReason,
     trigger_event_id: replayTriggerEventId,
     trigger_event_name: replayTriggerEventName
@@ -304,7 +329,7 @@
       status,
       reason,
       recorder: "rrweb",
-      sample_rate: replaySampleRate,
+      sample_rate: replayEffectiveSampleRate,
       event_count: eventCount,
       duration_ms: durationMs,
       chunk_count: chunkCount,
@@ -325,6 +350,14 @@
       replayUploadedBytes
     );
   }, "emitReplayMetadata");
+  const shouldEmitReplayLifecycleMetadata = /* @__PURE__ */ __name(() => replayUploadEnabled || replayCaptureReason === "sampled", "shouldEmitReplayLifecycleMetadata");
+  const emitReplayMetadataOrErrorFor = /* @__PURE__ */ __name((targetReplayId, status, reason, eventCount, durationMs, chunkCount, uploadedBytes) => {
+    if (shouldEmitReplayLifecycleMetadata()) {
+      emitReplayMetadataFor(targetReplayId, status, reason, eventCount, durationMs, chunkCount, uploadedBytes);
+    } else {
+      emitReplayErrorFor(targetReplayId, reason, eventCount, durationMs, chunkCount, uploadedBytes);
+    }
+  }, "emitReplayMetadataOrErrorFor");
   const stopReplayRecording = /* @__PURE__ */ __name((reason, dropQueuedEvents = false) => {
     if (!replayId || replayFinalized) return;
     stopReplayRecorderSafely();
@@ -333,11 +366,23 @@
       replayQueue.length = 0;
       clearReplayFlushTimer();
     }
-    emitReplayMetadata("stopped", reason);
+    if (shouldEmitReplayLifecycleMetadata()) {
+      emitReplayMetadata("stopped", reason);
+    }
     replayFinalized = true;
   }, "stopReplayRecording");
+  const stopReplayAtDurationLimit = /* @__PURE__ */ __name(() => {
+    if (!replayId || replayFinalized) return;
+    if (!replayUploadEnabled) {
+      stopReplayRecorderSafely();
+      clearReplayDurationTimer();
+      return;
+    }
+    stopReplayRecording("duration_limit", true);
+  }, "stopReplayAtDurationLimit");
   const markReplayCapturedByClientError = /* @__PURE__ */ __name((triggerEventId) => {
     if (!replayId || replayFinalized || replayCaptureReason === "client_error") return;
+    replayUploadEnabled = true;
     replayCaptureReason = "client_error";
     replayTriggerEventId = triggerEventId;
     replayTriggerEventName = "lovable.client_error";
@@ -355,7 +400,7 @@
   }, "emitReplayCaptureMetadataIfReady");
   const flushReplay = /* @__PURE__ */ __name((preferKeepalive = false) => {
     clearReplayFlushTimer();
-    if (!replayId || replayQueue.length === 0 || !replayHasFullSnapshot) return;
+    if (!replayUploadEnabled || !replayId || replayQueue.length === 0 || !replayHasFullSnapshot) return;
     while (!replayFinalized && replayQueue.length > 0) {
       let count2 = Math.min(replayQueue.length, maxReplayEventsPerChunk);
       const chunkID = randomId();
@@ -420,8 +465,22 @@
   }, "scheduleFlush");
   const rotatePageViewId = /* @__PURE__ */ __name(() => {
     pageViewId = randomId();
+    traceContext = createTraceContext();
     return pageViewId;
   }, "rotatePageViewId");
+  const traceFieldsFor = /* @__PURE__ */ __name((eventName) => {
+    if (eventName === "lovable.page_viewed") {
+      return {
+        trace_id: traceContext.traceId,
+        span_id: traceContext.rootSpanId
+      };
+    }
+    return {
+      trace_id: traceContext.traceId,
+      span_id: randomTraceHex(8),
+      parent_span_id: traceContext.rootSpanId
+    };
+  }, "traceFieldsFor");
   const shouldFlushImmediately = /* @__PURE__ */ __name((eventName) => eventName === "lovable.client_error" || eventName === "lovable.resource_error" || eventName === "lovable.replay_error", "shouldFlushImmediately");
   const refreshSession = /* @__PURE__ */ __name(() => {
     const now = Date.now();
@@ -444,7 +503,7 @@
     return true;
   }, "refreshSession");
   const queueEvent = /* @__PURE__ */ __name((eventName, eventSchemaVersion, properties = {}) => {
-    const activeReplayId = replayId && !replayFinalized ? replayId : null;
+    const activeReplayId = replayId && !replayFinalized && (replayUploadEnabled || eventName === "lovable.client_error") ? replayId : null;
     const eventId = randomId();
     const event = {
       event_id: eventId,
@@ -454,6 +513,7 @@
       anonymous_id: anonymousId,
       session_id: sessionId,
       page_view_id: pageViewId,
+      ...traceFieldsFor(eventName),
       properties
     };
     if (activeReplayId) event.replay_id = activeReplayId;
@@ -547,15 +607,17 @@
     emitPageView(navigationType);
   }, "emitPageViewIfPathChanged");
   const startReplayRecording = /* @__PURE__ */ __name(() => {
-    const record = replayMode === "rrweb" && isReplaySampledIn && w.rrweb && typeof w.rrweb.record === "function" ? w.rrweb.record : null;
+    const record = replayMode === "rrweb" && isReplayRecordingAllowed && w.rrweb && typeof w.rrweb.record === "function" ? w.rrweb.record : null;
     if (!record || replayId) return;
     replayId = randomId();
     replayStartedAt = perf.now();
     replayFinalized = false;
     replayChunkSequence = 0;
     replayUploadedBytes = 0;
+    replayRecorderActive = false;
     replayHasFullSnapshot = false;
-    replayCaptureReason = "sampled";
+    replayUploadEnabled = isReplaySampledIn;
+    replayCaptureReason = isReplaySampledIn ? "sampled" : null;
     replayTriggerEventId = null;
     replayTriggerEventName = null;
     replayCaptureMetadataEmitted = false;
@@ -565,7 +627,7 @@
           if (replayFinalized) return;
           if (!event || typeof event !== "object") return;
           if (replayDurationMs() >= maxReplayDurationMs) {
-            stopReplayRecording("duration_limit", true);
+            stopReplayAtDurationLimit();
             return;
           }
           const eventType = replayEventType(event);
@@ -579,7 +641,13 @@
           if (eventType === 2) replayHasFullSnapshot = true;
           replayEventCount += 1;
           replayQueue.push(event);
+          while (!replayUploadEnabled && replayQueue.length > maxReplayBufferedEvents) {
+            const removableIndex = replayQueue.findIndex((queuedEvent) => replayEventType(queuedEvent) !== 2);
+            replayQueue.splice(removableIndex >= 0 ? removableIndex : 0, 1);
+            replayEventCount = Math.max(0, replayEventCount - 1);
+          }
           if (emitReplayCaptureMetadataIfReady()) return;
+          if (!replayUploadEnabled) return;
           if (replayQueue.length >= maxReplayEventsPerChunk) {
             flushReplay();
           } else {
@@ -630,6 +698,7 @@
         }
         return;
       }
+      replayRecorderActive = true;
       if (typeof stop === "function") stopReplayRecorder = stop;
       const setTimer = w.setTimeout || (typeof setTimeout === "function" ? setTimeout : null);
       if (setTimer && typeof record.takeFullSnapshot === "function") {
@@ -642,25 +711,39 @@
         }, 1e3);
       }
       if (setTimer) {
-        replayDurationTimer = setTimer(() => stopReplayRecording("duration_limit", true), maxReplayDurationMs);
+        replayDurationTimer = setTimer(stopReplayAtDurationLimit, maxReplayDurationMs);
       }
-      emitReplayMetadata("started", "recorder_available");
+      if (shouldEmitReplayLifecycleMetadata()) {
+        emitReplayMetadata("started", "recorder_available");
+      }
     } catch {
-      emitReplayMetadata("stopped", "recorder_start_failed");
+      if (replayId) {
+        emitReplayMetadataOrErrorFor(
+          replayId,
+          "stopped",
+          "recorder_start_failed",
+          replayEventCount,
+          replayDurationMs(),
+          replayChunkSequence,
+          replayUploadedBytes
+        );
+      }
       replayId = null;
       replayEventCount = 0;
       replayStartedAt = 0;
       replayFinalized = false;
       replayHasFullSnapshot = false;
-      replayCaptureReason = "sampled";
+      replayUploadEnabled = isReplaySampledIn;
+      replayCaptureReason = isReplaySampledIn ? "sampled" : null;
       replayTriggerEventId = null;
       replayTriggerEventName = null;
       stopReplayRecorder = null;
+      replayRecorderActive = false;
       clearReplayDurationTimer();
     }
   }, "startReplayRecording");
   const ensureReplayRecorder = /* @__PURE__ */ __name(() => {
-    if (replayMode !== "rrweb" || !isReplaySampledIn || replayId || replayRecorderLoading) return;
+    if (replayMode !== "rrweb" || !isReplayRecordingAllowed || replayId || replayRecorderLoading) return;
     if (w.rrweb && typeof w.rrweb.record === "function") {
       startReplayRecording();
       return;
@@ -674,14 +757,14 @@
     recorderScript.onload = () => {
       replayRecorderLoading = false;
       if (!w.rrweb || typeof w.rrweb.record !== "function") {
-        emitReplayMetadataFor(randomId(), "stopped", "recorder_script_failed", 0, 0, 0, 0);
+        emitReplayMetadataOrErrorFor(randomId(), "stopped", "recorder_script_failed", 0, 0, 0, 0);
         return;
       }
       startReplayRecording();
     };
     recorderScript.onerror = () => {
       replayRecorderLoading = false;
-      emitReplayMetadataFor(randomId(), "stopped", "recorder_script_failed", 0, 0, 0, 0);
+      emitReplayMetadataOrErrorFor(randomId(), "stopped", "recorder_script_failed", 0, 0, 0, 0);
     };
     head.appendChild(recorderScript);
   }, "ensureReplayRecorder");
@@ -845,7 +928,11 @@
       return { anonymous_id: anonymousId, app_user_id_hash_available: !!appUserId };
     },
     getReplay() {
-      return { replay_id: replayId, active: !!replayId && !replayFinalized, event_count: replayEventCount };
+      return {
+        replay_id: replayId,
+        active: !!replayId && !replayFinalized && replayRecorderActive,
+        event_count: replayEventCount
+      };
     },
     resetIdentity() {
       appUserId = null;
